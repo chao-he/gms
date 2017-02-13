@@ -10,30 +10,28 @@
 #include "util.h"
 
 static const int kMaxDistance = 1<<15;
+static const int kCountBits = 12;
+static const int kMaxCount = (1<<kCountBits) - 1;
 
-const static int kCountBits = 12;
-const static int kMaxCount = (1<<kCountBits) - 1;
+static int bandwidth{200};
+static int innerloop{10};
+static int outerloop{10};
+static int max_samples{1000};
+static int num_thread{16};
 
 #define POS(id) ((id)>>kCountBits)
 #define CNT(id) ((id) % (kMaxCount + 1))
 #define COMBINE(id, cnt) (id<<kCountBits) + std::min(kMaxCount, (int)cnt)
 
 struct Point {
-  uint64_t id;
   int32_t x;
   int32_t y;
-  int c;
+  int32_t c;
   double w;
 
-  Point(): id(0), x(0), y(0), c(1) {}
-
-  Point(int x, int y): id(0), x(x), y(y), c(1) { }
-
-  Point(int x, int y, int c):
-    id(0), x(x), y(y), c(c) {}
-
-  Point(int x, int y, int c, int64_t id):
-    id(id), x(x), y(y), c(c) {}
+  Point(): x(0), y(0), c(1) {}
+  Point(int x, int y): x(x), y(y), c(1) { }
+  Point(int x, int y, int c): x(x), y(y), c(c) {}
 
   int DistanceTo(const Point &other) const {
     int dx = abs(x - other.x);
@@ -69,59 +67,47 @@ inline void D2XY(uint64_t pos, Point &pt) {
 
 class ApproximalNeighbor {
   public:
-    void Insert(const Point &pt) {
-      uint64_t d = XY2D(pt);
-      points1d.push_back(d);
-    }
-
     void Insert(const std::vector<Point> &points) {
-
       points1d.clear();
       points1d.reserve(points.size());
-
       for(const auto &pt: points) {
-        Insert(pt);
+        uint64_t d = XY2D(pt);
+        points1d.emplace_back(d);
       }
 
       // 合并相同的网格
       sort(points1d.begin(), points1d.end());
-
       std::vector<uint64_t> points1d_dup;
-
       for(auto iter = points1d.begin(); iter != points1d.end(); ) {
         uint64_t d = POS(*iter);
         uint64_t c = CNT(*iter);
-
         auto next = iter + 1;
         while (next != points1d.end() && d == POS(*next)) {
           c += CNT(*next);
           ++ next;
         }
         iter = next;
-        points1d_dup.push_back(COMBINE(d, c));
+        points1d_dup.emplace_back(COMBINE(d, c));
       }
       std::swap(points1d, points1d_dup);
     }
 
 
-    void Find(const Point &where, int d, std::vector<Point> &points) const {
-
-      points.clear();
-
+    void Find(const Point &where, int d, int n, std::vector<Point>& near) const {
+      near.clear();
       uint64_t target = XY2D(where);
       auto iter = std::lower_bound(points1d.begin(), points1d.end(), target);
-
       size_t start = 0, end = points1d.size();
       if (iter != points1d.end()) {
-        start = std::max<int>(0, iter - points1d.begin() - 100);
-        end = std::min(start + 200, points1d.size());
+        start = std::max<int>(0, iter - points1d.begin() - n);
+        end = std::min(start + 2 * n, points1d.size());
 
         Point pt;
         int d2 = d*d;
         for(size_t i = start; i < end; ++ i) {
           D2XY(points1d[i], pt);
           if (where.DistanceTo(pt) < d2) {
-            points.push_back(pt);
+            near.emplace_back(pt);
           }
         }
       }
@@ -130,16 +116,12 @@ class ApproximalNeighbor {
     std::vector<uint64_t> points1d;
 };
 
-int bandwidth{200};
-int innerloop{10};
-int outerloop{10};
-int maxSamples{500};
-
 
 template <typename Iter, typename KNN>
 void Fit1(Iter iter, Iter end, const KNN& nn) {
   double R = 5 * bandwidth;
   double H = 2 * bandwidth * bandwidth;
+  int N = 100;
 
   while (iter != end) {
     auto next = iter + 1;
@@ -147,17 +129,16 @@ void Fit1(Iter iter, Iter end, const KNN& nn) {
     while (next != end && *next == *iter) {
       ++ next;
     }
-    if (pt.c < maxSamples) {
+    if (pt.c < max_samples) {
       std::vector<Point> nears;
       for (int j = 0; j < innerloop; ++ j) {
-        nears.clear();
-        nn.Find(pt, R, nears);
+        nn.Find(pt, R, N, nears);
         if (nears.empty()) {
           break;
         }
         double n = 0, x = 0, y = 0;
         for(auto &qt: nears) {
-          qt.w = 0.5 * qt.c * Exp(-qt.DistanceTo(pt)/H);
+          qt.w = 0.5 * qt.c * Exp(-qt.DistanceTo(pt) / H);
           n += qt.w;
         }
 
@@ -170,10 +151,10 @@ void Fit1(Iter iter, Iter end, const KNN& nn) {
           x += w * qt.x;
           y += w * qt.y;
         }
-        int d = fabs(pt.x - x) + fabs(pt.x - x);
         pt.x = x;
         pt.y = y;
-        if (d < 3) {
+
+        if ((pt.x - x) * (pt.x - x) + (pt.y - y) * (pt.y - y) < 5) {
           break;
         }
       }
@@ -210,8 +191,8 @@ void Fit(std::vector<Point>& points) {
     if (points.size() < 100000) {
       Fit1(points.begin(), points.end(), nn);
     } else {
-      const int n = 16;
       std::vector<std::thread> workers;
+      int n = num_thread;
       int batch = points.size() / n;
       for (int i = 0; i < n; ++ i) {
         workers.emplace_back(std::thread([&points, &nn, i, n, batch] { 
@@ -238,30 +219,58 @@ void ReadPoints(const std::string& file, std::vector<Point>& points) {
   ifs.close();
 }
 
+void DumpPoints(const std::vector<Point>& points, const std::string& ofname) {
+  char of[200];
+  snprintf(of, sizeof(of), "%s-b_%d-l_%d-i_%d-m_%d", ofname.c_str(),
+      bandwidth, outerloop, innerloop, max_samples);
+  FILE* output = fopen(of, "w");
+  for (const auto& pt: points) {
+    double lat, lng;
+    geo::UTM2LatLng(pt.x, pt.y, lat, lng);
+    fprintf(output, "%.5f\t%.5f\t%d\n", lat, lng, pt.c);
+  }
+  fclose(output);
+}
+
 int main(int argc, char** argv) {
   int c = -1;
-  while (-1 != (c = getopt(argc, argv, "b:l:"))) {
+  std::string output;
+  while (-1 != (c = getopt(argc, argv, "b:i:m:n:l:"))) {
     switch(c) {
       case 'b':
         bandwidth = atoi(optarg);
         break;
+      case 'i':
+        innerloop = atoi(optarg);
+        break;
       case 'l':
         outerloop = atoi(optarg);
+        break;
+      case 'm':
+        max_samples = atoi(optarg);
+        break;
+      case 'n':
+        num_thread = atoi(optarg);
+        break;
+      case 'o':
+        output = optarg;
+        break;
+      default:
         break;
     }
   }
   argc -= optind;
   argv += optind;
 
+  if (argc == 0) {
+    printf("Usage: gms -b bandwidth -i innerloop -l outerloop -m max_samples -n threads -o output input\n");
+    return 0;
+  }
   // fprintf(stderr, "%s %d %d\n", argv[0], gms.outerloop, gms.bandwidth);
 
   std::vector<Point> points;
   ReadPoints(argv[0], points);
   Fit(points);
-  for (auto& pt: points) {
-    double lat, lng;
-    geo::UTM2LatLng(pt.x, pt.y, lat, lng);
-    printf("%.5f\t%.5f\t%d\n", lat, lng, pt.c);
-  }
+  DumpPoints(points, output);
   return 0;
 }
