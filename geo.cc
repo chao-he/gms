@@ -37,7 +37,7 @@ namespace geo {
     return S2CellId::FromLatLng(S2LatLng::FromE6(lat, lng)).parent(level).id();
   }
 
-  void Id2LatLng(u64 id, float *lat, float *lng, int *level) {
+  void Id2LatLng(u64 id, double *lat, double *lng, int *level) {
     S2CellId sid(id);
     S2LatLng ll = sid.ToLatLng();
     if (lat) *lat = ll.lat().degrees();
