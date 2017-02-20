@@ -12,11 +12,13 @@
 
 static int bandwidth = 30;
 static int innerloop = 10;
-static int outerloop = 50;
+static int outerloop = 30;
 static int max_samples = 200;
 static int num_thread = 40;
 static int MIN_BATCH_SIZE = 1e6;
-static int MIN_PACK_DISTANCE = 2;
+static int MIN_PACK_DISTANCE = 10;
+static int output_detail = 0;
+static int S2_LEVEL = 22;
 
 struct Point1D {
   uint64_t id;
@@ -54,7 +56,7 @@ class Point {
       : id_(0), c_(pt.c), x_(0), y_(0)
     {
       geo::LatLng2UTM(pt.lat, pt.lng, x_, y_);
-      id_ = geo::LatLng2Id(pt.lat, pt.lng, 30);
+      id_ = geo::LatLng2Id(pt.lat, pt.lng, S2_LEVEL);
     }
 
     explicit Point(const PointXY& pt)
@@ -73,7 +75,7 @@ class Point {
     void set_xy(double x, double y) {
       double lat = 0, lng = 0;
       geo::UTM2LatLng(x, y, lat, lng);
-      id_ = geo::LatLng2Id(lat, lng, 30);
+      id_ = geo::LatLng2Id(lat, lng, S2_LEVEL);
       x_ = x;
       y_ = y;
     }
@@ -86,9 +88,9 @@ class Point {
 };
 
 struct PointNearBy {
-  Point1D pt;
+  const Point& pt;
   double d;
-  PointNearBy(const Point1D& pt, double d): pt(pt), d(d) {}
+  PointNearBy(const Point& pt, double d): pt(pt), d(d) {}
 };
 
 bool operator<(const Point1D& a, const Point1D& b) { return a.id < b.id; }
@@ -97,37 +99,29 @@ bool operator==(const Point1D& a, const Point1D& b) { return a.id == b.id; }
 bool operator<(const Point& a, const Point& b) { return a.id() < b.id() || (a.id() == b.id() && a.c() > b.c()); }
 bool operator==(const Point& a, const Point& b) { return a.id() == b.id(); }
 
+const int MAX_DISTANCE = 100000;
+double Distance(const Point& a, const Point& b) { 
+  long dx = a.x() - b.x();
+  long dy = a.y() - b.y();
+  return labs(dx) + labs(dy) > MAX_DISTANCE ? MAX_DISTANCE : dx * dx + dy * dy;
+  // printf ("%lu\t%lu\t%g\t%d\n", a.id(), b.id(), d, geo::DistanceOfId(a.id(), b.id()));
+}
 
 class ApproximalNeighbor {
   public:
     template <typename iterator>
     ApproximalNeighbor(iterator beg, iterator end) {
-     for(auto iter = beg; iter != end; ++ iter) {
-       points1d_.emplace_back(iter->id(), iter->c());
+      points1d_.reserve(end - beg);
+      for(auto iter = beg; iter != end; ++ iter) {
+        points1d_.emplace_back(*iter);
       }
     }
 
-    void Find(const Point &where, int d, int n, std::vector<PointNearBy>& near) const {
-      Point1D target(where.id(), where.c());
-      auto iter = std::lower_bound(points1d_.begin(), points1d_.end(), target);
-      size_t start = 0, end = points1d_.size();
-      if (iter != points1d_.end()) {
-        start = std::max<int>(0, iter - points1d_.begin() - n);
-        end = std::min(start + 2 * n, points1d_.size());
-
-        int d2 = d*d;
-        for(size_t i = start; i < end; ++ i) {
-          auto d = geo::DistanceOfId(where.id(), points1d_[i].id);
-          if (d >= d2) continue;
-          near.emplace_back(points1d_[i], d);
-        }
-      }
-    }
-
-    void Project(const Point &where, int d, int n, double H, std::vector<PointNearBy>& near) const {
-      Find(where, d, n, near);
+    void Project(const Point& p, int band, std::vector<PointNearBy>& near) const {
+      double R = 10 * band, H = 2 * band * band;
+      Find(p, R, 100, near);
       for (auto& p: near) {
-        p.d = 0.5 * p.pt.c * Exp(-p.d / H);
+        p.d = 0.5 * p.pt.c() * Exp(-p.d / H);
       }
       double z = 1e-15;
       for (auto& p: near) {
@@ -138,23 +132,33 @@ class ApproximalNeighbor {
       }
     }
 
+  protected:
+    void Find(const Point &target, int r, int n, std::vector<PointNearBy>& near) const {
+      auto iter = std::lower_bound(points1d_.begin(), points1d_.end(), target);
+      long beg = std::max<long>(0, iter - points1d_.begin() - n);
+      long end = std::min<long>(beg + 2 * n, points1d_.size());
+      r *= r;
+      for(long i = beg; i < end; ++ i) {
+        // auto d = geo::DistanceOfId(target.id, points1d_[i].id);
+        auto d = Distance(target, points1d_[i]);
+        if (d >= r) continue;
+        near.emplace_back(points1d_[i], d);
+      }
+    }
+
   private:
-    std::vector<Point1D> points1d_;
+    std::vector<Point> points1d_;
 };
 
 
 void Fit1(std::vector<Point>::iterator beg, std::vector<Point>::iterator end) {
-  double R = 5 * bandwidth;
-  double H = 2 * bandwidth * bandwidth;
-  int N = 100;
-
   ApproximalNeighbor nn(beg, end);
   for (auto iter = beg; iter != end; ++ iter) {
     std::vector<PointNearBy> nears;
     Point &pt = *iter;
     for (int j = 0; j < innerloop; ++ j) {
       nears.clear();
-      nn.Project(pt, R, N, H, nears);
+      nn.Project(pt, bandwidth, nears);
       if (nears.empty()) {
         break;
       }
@@ -175,7 +179,7 @@ void Pack(std::vector<Point>& points) {
   for(auto iter = points.begin(), next = iter; iter != points.end(); iter = next) {
     next = iter + 1;
     double c = iter->c();
-    while (next != points.end() && geo::DistanceOfId(next->id(), iter->id()) < MIN_PACK_DISTANCE) {
+    while (next != points.end() && Distance(*next, *iter) < MIN_PACK_DISTANCE) {
       c += next->c();
       ++ next;
     }
@@ -188,8 +192,6 @@ void Pack(std::vector<Point>& points) {
 
 void Fit(std::vector<Point>& points) {
   std::sort(points.begin(), points.end()); 
-  Pack(points);
-
   for (int i = 0; i < outerloop; ++ i) {
     std::vector<std::thread> workers;
     int n = std::min<int>(num_thread, ceil(points.size() / (double)MIN_BATCH_SIZE));
@@ -206,16 +208,77 @@ void Fit(std::vector<Point>& points) {
   }
 }
 
-void ReadPoints(const std::string& file, std::vector<Point>& points) {
-  double lat = 0, lng = 0;
-  std::ifstream ifs(file);
-  while(ifs>>lat>>lng) {
-    points.emplace_back(PointLL(lat, lng, 1));
+void ReadPointsF1(std::istream& iss, std::vector<Point>& points) {
+  double lat = 0, lng = 0, cnt = 1;
+  while(iss>>lat>>lng>>cnt) {
+    points.emplace_back(PointLL(lat, lng, cnt));
   }
-  ifs.close();
 }
 
-static int output_format = 0;
+void ReadPointsF2(std::istream& iss, std::vector<Point>& points) {
+  double lat = 0, lng = 0;
+  uint64_t uid;
+  while(iss>>uid>>lat>>lng) {
+    points.emplace_back(PointLL(lat, lng, 1));
+  }
+}
+
+int CheckFileFormat(const std::string& file) {
+  std::string line;
+  std::ifstream ifs(file);
+  std::getline(ifs, line);
+  ifs.close();
+  auto q = line.find('.');
+  auto p = line.find('\t');
+  if (p == line.npos) {
+    p = line.find(' ');
+  }
+  return q < p ? 1 : 0;
+}
+
+void ReadPoints(const std::string& file, std::vector<Point>& points) {
+  std::ifstream ifs(file);
+  if (CheckFileFormat(file)) {
+    ReadPointsF1(ifs, points);
+  } else {
+    ReadPointsF2(ifs, points);
+  }
+  ifs.close();
+  Pack(points);
+}
+
+void SPP(const std::string& model, const std::string& input) {
+  std::vector<Point> points;
+  ReadPoints(model, points);
+  ApproximalNeighbor nn(points.begin(), points.end());
+  
+  uint64_t uid;
+  double lat = 0, lng = 0;
+  std::ifstream ifs(input);
+  std::vector<PointNearBy> near;
+  while (ifs>>uid>>lat>>lng) {
+    Point pt(PointLL(lat, lng, 1));
+    near.clear();
+    nn.Project(pt, bandwidth, near);
+    for (auto& n: near) {
+      if (n.d > 0.001) {
+        switch(output_detail) {
+          case 0:
+            printf ("%lu\t%lu\t%d\t%g\n", uid, n.pt.id(), n.pt.c(), n.d);
+            break;
+          case 1:
+            {
+              double lat = 0, lng = 0;
+              geo::Id2LatLng(n.pt.id(), &lat, &lng, NULL);
+              printf("%.5f\t%.5f\t%u\t%g\n", lat, lng, n.pt.c(), n.d);
+            }
+            break;
+        }
+
+      }
+    }
+  }
+}
 
 void DumpPoints(const std::vector<Point>& points, const std::string& ofname) {
   char of[200];
@@ -223,9 +286,9 @@ void DumpPoints(const std::vector<Point>& points, const std::string& ofname) {
       bandwidth, outerloop, innerloop, max_samples);
   FILE* output = fopen(of, "w");
   for (auto& pt: points) {
-    switch(output_format) {
+    switch(output_detail) {
       case 0:
-        fprintf(output, "%llu\t%u\n", pt.id(), pt.c());
+        fprintf(output, "%lu\t%u\n", pt.id(), pt.c());
         break;
       case 1:
         {
@@ -241,8 +304,9 @@ void DumpPoints(const std::vector<Point>& points, const std::string& ofname) {
 
 int main(int argc, char** argv) {
   int c = -1;
+  int do_project = 0;
   std::string output;
-  while (-1 != (c = getopt(argc, argv, "b:i:m:n:l:o:d"))) {
+  while (-1 != (c = getopt(argc, argv, "b:di:m:n:l:po:"))) {
     switch(c) {
       case 'b':
         bandwidth = atoi(optarg);
@@ -263,7 +327,10 @@ int main(int argc, char** argv) {
         output = optarg;
         break;
       case 'd':
-        output_format = 1;
+        output_detail = 1;
+        break;
+      case 'p':
+        do_project = 1;
         break;
       default:
         break;
@@ -278,9 +345,17 @@ int main(int argc, char** argv) {
   }
   // fprintf(stderr, "%s %d %d\n", argv[0], gms.outerloop, gms.bandwidth);
 
-  std::vector<Point> points;
-  ReadPoints(argv[0], points);
-  Fit(points);
-  DumpPoints(points, output);
+  if (do_project == 0) {
+    std::vector<Point> points;
+    ReadPoints(argv[0], points);
+    Fit(points);
+    DumpPoints(points, output);
+  } else {
+    if (argc != 2) {
+      printf("Usage: gms -p model input\n");
+      return 0;
+    }
+    SPP(argv[0], argv[1]);
+  }
   return 0;
 }
