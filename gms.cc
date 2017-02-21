@@ -18,11 +18,11 @@ static int outerloop = 30;
 static int max_samples = 200;
 static int min_samples = 1;
 static int num_thread = 40;
-static int output_detail = 0;
-static int MIN_BATCH_SIZE = 1e6;
-static int MIN_PACK_DISTANCE = 10;
-static int S2_LEVEL = 22;
-static double MIN_PROB = 1e-2;
+static int min_batch_size = 1e6;
+static int min_pack_distance = 10;
+static int s2_level = 22;
+static int debug = 0;
+static double min_prob = 1e-2;
 
 struct Point1D {
   uint64_t id;
@@ -60,7 +60,7 @@ class Point {
       : id_(0), c_(pt.c), x_(0), y_(0)
     {
       geo::LatLng2UTM(pt.lat, pt.lng, x_, y_);
-      id_ = geo::LatLng2Id(pt.lat, pt.lng, S2_LEVEL);
+      id_ = geo::LatLng2Id(pt.lat, pt.lng, s2_level);
     }
 
     explicit Point(const PointXY& pt)
@@ -77,7 +77,7 @@ class Point {
     void set_xy(double x, double y) {
       double lat = 0, lng = 0;
       geo::UTM2LatLng(x, y, lat, lng);
-      id_ = geo::LatLng2Id(lat, lng, S2_LEVEL);
+      id_ = geo::LatLng2Id(lat, lng, s2_level);
       x_ = x;
       y_ = y;
     }
@@ -182,7 +182,7 @@ void Fit1(std::vector<Point>::iterator beg, std::vector<Point>::iterator end) {
 void Pack(std::vector<Point>& points) {
   std::vector<Point> dup;
   std::sort(points.begin(), points.end());
-  long min_distance = MIN_PACK_DISTANCE * MIN_PACK_DISTANCE;
+  long min_distance = min_pack_distance * min_pack_distance;
   for(auto iter = points.begin(), next = iter; iter != points.end(); iter = next) {
     next = iter + 1;
     double c = iter->c();
@@ -201,7 +201,7 @@ void Fit(std::vector<Point>& points) {
   std::sort(points.begin(), points.end()); 
   for (int i = 0; i < outerloop; ++ i) {
     std::vector<std::thread> workers;
-    int n = std::min<int>(num_thread, ceil(points.size() / (double)MIN_BATCH_SIZE));
+    int n = std::min<int>(num_thread, ceil(points.size() / (double)min_batch_size));
     int b = points.size() / n;
     for (int i = 0; i < n; ++ i) {
       workers.emplace_back(std::thread([&points, i, n, b] { 
@@ -286,15 +286,12 @@ void DumpPoints(const std::vector<Point>& points, const std::string& ofname) {
   FILE* output = fopen(of, "w");
   double lat = 0, lng = 0;
   for (auto& pt: points) {
-    if (pt.c() < min_samples) continue;
-    switch(output_detail) {
-      case 0:
-        fprintf(output, "%lu\t%u\n", pt.id(), pt.c());
-        break;
-      case 1:
-        geo::Id2LatLng(pt.id(), &lat, &lng, NULL);
-        fprintf(output, "%.5f\t%.5f\t%u\n", lat, lng, pt.c());
-        break;
+    if (pt.c() < (uint32_t ) min_samples) continue;
+    if (debug == 0) {
+      fprintf(output, "%lu\t%u\n", pt.id(), pt.c());
+    } else {
+      geo::Id2LatLng(pt.id(), &lat, &lng, NULL);
+      fprintf(output, "%.5f\t%.5f\t%u\n", lat, lng, pt.c());
     }
   }
   fclose(output);
@@ -306,16 +303,13 @@ void show_result(uint64_t uid, std::vector<PointNearBy>& r) {
   double lat = 0, lng = 0;
   // std::sort (r.begin(), r.end(), [](const PointNearBy& a, const PointNearBy& b) { return a.weight() > b.weight(); });
   for (auto& n: r) {
-    if (n.d < MIN_PROB) continue;
+    if (n.d < min_prob) continue;
     std::lock_guard<std::mutex> lock(g_lock);
-    switch(output_detail) {
-      case 0:
-        printf ("%lu\t%lu\t%g\n", uid, n.pt.id(), n.weight());
-        break;
-      case 1:
-        geo::Id2LatLng(n.pt.id(), &lat, &lng, NULL);
-        printf ("%lu\t%.5f\t%.5f\t%u\t%g\n", uid, lat, lng, n.count(), n.weight());
-        break;
+    if (debug == 0) {
+      printf ("%lu\t%lu\t%g\n", uid, n.pt.id(), n.weight());
+    } else {
+      geo::Id2LatLng(n.pt.id(), &lat, &lng, NULL);
+      printf ("%lu\t%.5f\t%.5f\t%u\t%g\n", uid, lat, lng, n.count(), n.weight());
     }
   }
 }
@@ -331,7 +325,7 @@ void SPP(const std::string& model, const std::string& input) {
   ReadPoints(input, points);
 
   std::vector<std::thread> workers;
-  int n = std::min<int>(num_thread, ceil(points.size() / (double) MIN_BATCH_SIZE));
+  int n = std::min<int>(num_thread, ceil(points.size() / (double) min_batch_size));
   int b = points.size() / n;
   for (int i = 0; i < n; ++ i) {
     workers.emplace_back(std::thread([&nn, &points, i, n, b] { 
@@ -378,16 +372,16 @@ int main(int argc, char** argv) {
         output = optarg;
         break;
       case 'd':
-        output_detail = 1;
+        debug= 1;
         break;
       case 'p':
         do_project = 1;
         break;
       case 'P':
-        MIN_PACK_DISTANCE = atoi(optarg);
+        min_pack_distance = atoi(optarg);
         break;
       case 'M':
-        MIN_PROB = atof(optarg);
+        min_prob = atof(optarg);
         break;
       default:
         break;
